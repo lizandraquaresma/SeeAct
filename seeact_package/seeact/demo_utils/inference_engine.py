@@ -46,6 +46,16 @@ def load_gemini_api_key():
     ), "must pass on the api_key or set GEMINI_API_KEY in the environment"
     return os.getenv("GEMINI_API_KEY")
 
+
+def load_openrouter_api_key():
+    load_dotenv()
+    assert (
+            os.getenv("OPENROUTER_API_KEY") is not None and
+            os.getenv("OPENROUTER_API_KEY") != EMPTY_API_KEY
+    ), "must pass on the api_key or set OPENROUTER_API_KEY in the environment"
+    return os.getenv("OPENROUTER_API_KEY")
+
+
 def encode_image(image_path):
     with open(image_path, "rb") as image_file:
         return base64.b64encode(image_file.read()).decode('utf-8')
@@ -59,18 +69,24 @@ def engine_factory(api_key=None, model=None, **kwargs):
         else:
             load_openai_api_key()
         return OpenAIEngine(model=model, **kwargs)
-    elif model in ["gemini-1.5-pro-latest", "gemini-1.5-flash"]:
+    elif model.startswith("gemini-"):
         if api_key and api_key != EMPTY_API_KEY:
             os.environ["GEMINI_API_KEY"] = api_key
         else:
             load_gemini_api_key()
         model=f"gemini/{model}"
         return GeminiEngine(model=model, **kwargs)
+    elif model.startswith("openrouter/"):
+        if api_key and api_key != EMPTY_API_KEY:
+            os.environ["OPENROUTER_API_KEY"] = api_key
+        else:
+            load_openrouter_api_key()
+        return OpenRouterEngine(model=model, **kwargs)
     elif model == "llava":
         model="llava"
         return OllamaEngine(model=model, **kwargs)
-    raise Exception(f"Unsupported model: {model}, currently supported models: \
-                    gpt-4-vision-preview, gpt-4-turbo, gpt-4o, , gpt-4o-mini, gemini-1.5-pro-latest, llava")
+    raise Exception(f"Unsupported model: {model}. Use an OpenAI model supported above, "
+                    "a Gemini model whose name starts with 'gemini-', an OpenRouter model starting with 'openrouter/', or llava.")
 
 class Engine:
     def __init__(
@@ -183,15 +199,14 @@ class GeminiEngine(Engine):
             wait_time = self.next_avil_time[self.current_key_idx] - start_time
             print(f"Wait {wait_time} for rate limitting")
         prompt0, prompt1, prompt2 = prompt
-        litellm.set_verbose=True
-
         base64_image = encode_image(image_path)
+        image_data_url = f"data:image/png;base64,{base64_image}"
         if turn_number == 0:
             # Assume one turn dialogue
             prompt_input = [
                 {"role": "system", "content": prompt0},
                 {"role": "user",
-                 "content": [{"type": "text", "text": prompt1}, {"type": "image_url", "image_url": {"url": image_path,
+                 "content": [{"type": "text", "text": prompt1}, {"type": "image_url", "image_url": {"url": image_data_url,
                                                                                                     "detail": "high"},
                                                                 }]},
             ]
@@ -199,7 +214,7 @@ class GeminiEngine(Engine):
             prompt_input = [
                 {"role": "system", "content": prompt0},
                 {"role": "user",
-                 "content": [{"type": "text", "text": prompt1}, {"type": "image_url", "image_url": {"url": image_path,
+                 "content": [{"type": "text", "text": prompt1}, {"type": "image_url", "image_url": {"url": image_data_url,
                                                                                                     "detail": "high"}, 
                                                                 }]},
                 {"role": "assistant", "content": [{"type": "text", "text": f"\n\n{ouput_0}"}]},
@@ -268,6 +283,69 @@ class OpenAIEngine(Engine):
             **kwargs,
         )
         return [choice["message"]["content"] for choice in response.choices][0]
+
+
+class OpenRouterEngine(Engine):
+    """
+    Init an OpenRouter engine using LiteLLM.
+    Supports multimodal models on OpenRouter (e.g. openrouter/google/gemma-4-31b-it:free, openrouter/qwen/qwen3.8-27b:free, openrouter/anthropic/claude-3.5-sonnet).
+    """
+    def __init__(self, api_key=None, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.api_key = api_key or os.getenv("OPENROUTER_API_KEY")
+
+    @backoff.on_exception(
+        backoff.expo,
+        (APIError, RateLimitError, APIConnectionError),
+        max_tries=3,
+    )
+    def generate(self, prompt: list = None, max_new_tokens=4096, temperature=None, model=None, image_path=None,
+                 ouput_0=None, turn_number=0, **kwargs):
+        self.current_key_idx = (self.current_key_idx + 1) % len(self.time_slots)
+        start_time = time.time()
+        if (
+                self.request_interval > 0
+                and start_time < self.next_avil_time[self.current_key_idx]
+        ):
+            time.sleep(self.next_avil_time[self.current_key_idx] - start_time)
+        prompt0, prompt1, prompt2 = prompt
+
+        base64_image = encode_image(image_path)
+        image_data_url = f"data:image/png;base64,{base64_image}"
+        if turn_number == 0:
+            prompt_input = [
+                {"role": "system", "content": prompt0},
+                {"role": "user",
+                 "content": [
+                     {"type": "text", "text": prompt1},
+                     {"type": "image_url", "image_url": {"url": image_data_url}},
+                 ]},
+            ]
+        elif turn_number == 1:
+            prompt_input = [
+                {"role": "system", "content": prompt0},
+                {"role": "user",
+                 "content": [
+                     {"type": "text", "text": prompt1},
+                     {"type": "image_url", "image_url": {"url": image_data_url}},
+                 ]},
+                {"role": "assistant", "content": f"\n\n{ouput_0}"},
+                {"role": "user", "content": prompt2}, 
+            ]
+
+        try:
+            response = litellm.completion(
+                model=model if model else self.model,
+                messages=prompt_input,
+                max_tokens=max_new_tokens if max_new_tokens else 4096,
+                temperature=temperature if temperature else self.temperature,
+                api_key=self.api_key or os.getenv("OPENROUTER_API_KEY"),
+                **kwargs,
+            )
+            return [choice["message"]["content"] for choice in response.choices][0]
+        except Exception as e:
+            print(f"\n[OpenRouter Error]: {e}\n")
+            raise e
 
 
 class OpenaiEngine_MindAct(Engine):

@@ -812,14 +812,31 @@ To be successful, it is important to follow the following rules:
             return 1
 
     async def stop(self):
+        context = self.session_control.get('context')
+        browser = self.session_control.get('browser')
+        self.session_control['context'] = None
+        self.session_control['browser'] = None
 
-        try:
-            close_context = self.session_control['context']
-            self.session_control['context'] = None
-            await close_context.close()
-            self.logger.info("Browser context closed.")
-        except Exception as e:
-            self.logger.info(e)
+        if context is not None:
+            try:
+                await context.close()
+                self.logger.info("Browser context closed.")
+            except Exception as e:
+                self.logger.info(e)
+
+        if browser is not None:
+            try:
+                await browser.close()
+            except Exception as e:
+                self.logger.info(e)
+
+        playwright = getattr(self, 'playwright', None)
+        self.playwright = None
+        if playwright is not None:
+            try:
+                await playwright.stop()
+            except Exception as e:
+                self.logger.info(e)
 
         final_json = {"task": self.tasks, "website": self.config["basic"]["default_website"],
                       "num_step": len(self.taken_actions), "action_history": self.taken_actions}
